@@ -12,7 +12,10 @@ import (
 	"time"
 )
 
-const bufSize = 64 * 1024 // 64KB 缓冲区
+const (
+	bufferSize   = 16 * 1024 * 1024 // 16MB 缓冲区
+	progressStep = 64 * 1024 * 1024 // 64MB显示一次进度
+)
 
 type Splitter struct {
 	input  string // 输入文件路径
@@ -45,7 +48,7 @@ func (s *Splitter) hasValid(statement string) bool {
 	return hasValid
 }
 
-func (s *Splitter) extractTable(statement string) string {
+func (s *Splitter) parseTable(statement string) string {
 	upper := strings.ToUpper(strings.TrimSpace(statement))
 
 	// SQL语句模式：支持CREATE TABLE、INSERT、UPDATE、DELETE、ALTER TABLE、DROP TABLE
@@ -65,16 +68,10 @@ func (s *Splitter) extractTable(statement string) string {
 			return strings.Trim(strings.ToLower(matches[1]), "`")
 		}
 	}
-	return "" // 未识别的语句
+	return "misc" // 无法识别表名的语句归类为misc
 }
 
-// writeStatement 将SQL语句写入对应表名的文件（合并了缓冲和文件操作）
 func (s *Splitter) writeStatement(table, statement string) error {
-	if table == "" {
-		table = "misc" // 无法识别表名的语句归类为misc
-	}
-
-	// 获取或创建文件句柄
 	_, exists := s.tables[table]
 	if !exists {
 		p := filepath.Join(s.output, table+".sql")
@@ -88,12 +85,14 @@ func (s *Splitter) writeStatement(table, statement string) error {
 	// 添加到缓冲区
 	s.buffers[table] = append(s.buffers[table], statement)
 
-	// 检查是否需要刷新缓冲区（每1000条语句或缓冲区过大时）
+	// 检查是否需要刷新缓冲区（减少IO次数提升性能）
 	total := 0
-	for _, buf := range s.buffers {
-		total += len(buf)
+	for _, buffer := range s.buffers {
+		for _, buf := range buffer {
+			total += len(buf)
+		}
 	}
-	if total > 1000 {
+	if total > bufferSize {
 		return s.flushBuffers()
 	}
 	return nil
@@ -111,21 +110,27 @@ func (s *Splitter) flushBuffers() error {
 			continue
 		}
 
-		file := s.tables[t]
+		// 合并缓冲区
+		str := strings.Builder{}
+		str.Grow(len(buffer) * 100)
 		for _, buf := range buffer {
-			if _, err := file.WriteString(buf + "\n"); err != nil {
-				return fmt.Errorf("写入文件失败: %w", err)
-			}
+			str.WriteString(buf)
+			str.WriteByte('\n')
+		}
+
+		// 写入目标文件
+		file := s.tables[t]
+		_, err := file.WriteString(str.String())
+		if err != nil {
+			return fmt.Errorf("写入文件失败: %w", err)
 		}
 
 		// 清空缓冲区释放内存
 		s.buffers[t] = s.buffers[t][:0]
 	}
-
 	return nil
 }
 
-// Split 执行SQL文件拆分的主要方法（使用缓冲区读取优化）
 func (s *Splitter) Split() error {
 	var (
 		err error
@@ -133,13 +138,19 @@ func (s *Splitter) Split() error {
 		input     *os.File
 		inputInfo os.FileInfo
 
-		startTime      = time.Now()
-		totalBytes     = inputInfo.Size()
-		processedBytes = int64(0)
+		count    int64
+		leftover string // 存储缓冲区边界上的不完整语句
 
-		leftover       string // 存储缓冲区边界上的不完整语句
-		statementCount int64
+		startTime      = time.Now()
+		totalBytes     = int64(0)
+		processedBytes = int64(0)
 	)
+
+	// 创建输出目录
+	err = os.MkdirAll(s.output, os.ModePerm)
+	if err != nil {
+		return fmt.Errorf("创建输出目录失败: %w", err)
+	}
 
 	// 打开输入文件
 	input, err = os.Open(s.input)
@@ -156,17 +167,11 @@ func (s *Splitter) Split() error {
 	if err != nil {
 		return fmt.Errorf("获取输入文件信息失败: %w", err)
 	}
-
-	// 创建输出目录
-	err = os.MkdirAll(s.output, os.ModePerm)
-	if err != nil {
-		return fmt.Errorf("创建输出目录失败: %w", err)
-	}
-
+	totalBytes = inputInfo.Size()
 	fmt.Printf("正在处理文件: %s (%.2f GB)\n", s.input, float64(totalBytes)/(1024*1024*1024))
 
 	n := 0
-	buffer := make([]byte, bufSize)
+	buffer := make([]byte, bufferSize)
 	for {
 		n, err = input.Read(buffer)
 		if err == io.EOF {
@@ -178,15 +183,11 @@ func (s *Splitter) Split() error {
 		if n > 0 {
 			processedBytes += int64(n)
 
-			// 内联进度显示（每处理10MB显示一次）
-			if processedBytes%(10*1024*1024) == 0 && totalBytes > 0 {
-				percentage := float64(processedBytes) / float64(totalBytes) * 100
+			// 简化进度显示（每50MB显示一次）
+			if processedBytes%progressStep == 0 && totalBytes > 0 {
 				elapsed := time.Since(startTime)
-				estimatedTotal := time.Duration(float64(elapsed) * float64(totalBytes) / float64(processedBytes))
-				remaining := estimatedTotal - elapsed
-				fmt.Printf("\r进度: %.2f%% (%d/%d 字节) - 已用时: %v - 预计剩余: %v",
-					percentage, processedBytes, totalBytes,
-					elapsed.Round(time.Second), remaining.Round(time.Second))
+				percentage := float64(processedBytes) / float64(totalBytes) * 100
+				fmt.Printf("\r进度: %.2f%% - 已用时: %v", percentage, elapsed.Round(time.Second))
 			}
 
 			// 将读取的数据与上次的剩余数据合并
@@ -200,11 +201,11 @@ func (s *Splitter) Split() error {
 			for i := 0; i < len(statements)-1; i++ {
 				statement := strings.TrimSpace(statements[i])
 				if s.hasValid(statement) {
-					err = s.writeStatement(s.extractTable(statement), statement+";")
+					err = s.writeStatement(s.parseTable(statement), statement+";")
 					if err != nil {
 						return err
 					}
-					statementCount++
+					count++
 				}
 			}
 
@@ -213,11 +214,11 @@ func (s *Splitter) Split() error {
 			if err == io.EOF {
 				// 文件结束，处理最后一个语句（如果有的话）
 				if s.hasValid(lastPart) {
-					err = s.writeStatement(s.extractTable(lastPart), lastPart)
+					err = s.writeStatement(s.parseTable(lastPart), lastPart)
 					if err != nil {
 						return err
 					}
-					statementCount++
+					count++
 				}
 			} else {
 				// 不是文件结束，保存为下次处理的剩余数据
@@ -226,20 +227,15 @@ func (s *Splitter) Split() error {
 		}
 	}
 
-	// 最终刷新所有缓冲区
+	// 刷新所有缓冲区
 	err = s.flushBuffers()
 	if err != nil {
 		return err
 	}
 
-	// 显示最终进度和结果
-	if totalBytes > 0 {
-		percentage := float64(processedBytes) / float64(totalBytes) * 100
-		elapsed := time.Since(startTime)
-		fmt.Printf("\r进度: %.2f%% (%d/%d 字节) - 总用时: %v",
-			percentage, processedBytes, totalBytes, elapsed.Round(time.Second))
-	}
-	fmt.Printf("\n处理完成！共处理 %d 条SQL语句\n", statementCount)
+	// 显示最终结果
+	elapsed := time.Since(startTime)
+	fmt.Printf("\r处理完成！共处理 %d 条SQL语句 - 总用时: %v\n", count, elapsed.Round(time.Second))
 	return nil
 }
 
@@ -275,10 +271,8 @@ func main() {
 	fmt.Printf("拆分文件: %s\n", *input)
 	fmt.Printf("输出目录: %s\n", *output)
 
-	// 创建拆分器
-	splitter := NewSplitter(*input, *output)
-
 	// 执行拆分操作
+	splitter := NewSplitter(*input, *output)
 	if err := splitter.Split(); err != nil {
 		fmt.Printf("错误: %v\n", err)
 		os.Exit(1)
