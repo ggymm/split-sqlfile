@@ -1,4 +1,3 @@
-// SQL文件拆分工具 - 按表名将大型SQL文件拆分为多个小文件
 package main
 
 import (
@@ -12,15 +11,22 @@ import (
 	"time"
 )
 
-const (
-	bufferSize   = 16 * 1024 * 1024 // 16MB 缓冲区
-	progressStep = 64 * 1024 * 1024 // 64MB显示一次进度
+const bufferSize = 16 * 1024 * 1024 // 16MB 缓冲区
+
+var (
+	dropReg   = regexp.MustCompile(`DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:` + "`" + `)?([^` + "`" + `\s]+)(?:` + "`" + `)?`)
+	alterReg  = regexp.MustCompile(`ALTER\s+TABLE\s+(?:` + "`" + `)?([^` + "`" + `\s]+)(?:` + "`" + `)?`)
+	createReg = regexp.MustCompile(`CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:` + "`" + `)?([^` + "`" + `\s]+)(?:` + "`" + `)?`)
+	insertReg = regexp.MustCompile(`INSERT\s+INTO\s+(?:` + "`" + `)?([^` + "`" + `\s]+)(?:` + "`" + `)?`)
+	updateReg = regexp.MustCompile(`UPDATE\s+(?:` + "`" + `)?([^` + "`" + `\s]+)(?:` + "`" + `)?`)
+	deleteReg = regexp.MustCompile(`DELETE\s+FROM\s+(?:` + "`" + `)?([^` + "`" + `\s]+)(?:` + "`" + `)?`)
 )
 
 type Splitter struct {
 	input  string // 输入文件路径
 	output string // 输出目录路径
 
+	count   int                 // 缓存总字节数，避免重复计算
 	tables  map[string]*os.File // 按表名缓存的文件句柄
 	buffers map[string][]string // 按表名缓存的SQL语句缓冲区
 }
@@ -34,44 +40,25 @@ func NewSplitter(inputFile, outputDir string) *Splitter {
 	}
 }
 
-func (s *Splitter) hasValid(statement string) bool {
-	hasValid := false
-	if statement != "" {
-		for _, line := range strings.Split(statement, "\n") {
-			trimmed := strings.TrimSpace(line)
-			if trimmed != "" && !strings.HasPrefix(trimmed, "--") && !strings.HasPrefix(trimmed, "/*") {
-				hasValid = true
-				break
-			}
-		}
+func (s *Splitter) parseTable(stmt string) string {
+	upper := strings.ToUpper(stmt)
+	regexes := []*regexp.Regexp{
+		insertReg, createReg, // 最常用
+		updateReg, deleteReg, alterReg, dropReg, // 较少使用
 	}
-	return hasValid
-}
-
-func (s *Splitter) parseTable(statement string) string {
-	upper := strings.ToUpper(strings.TrimSpace(statement))
-
-	// SQL语句模式：支持CREATE TABLE、INSERT、UPDATE、DELETE、ALTER TABLE、DROP TABLE
-	patterns := []string{
-		`CREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:` + "`" + `)?([^` + "`" + `\s]+)(?:` + "`" + `)?`,
-		`INSERT\s+INTO\s+(?:` + "`" + `)?([^` + "`" + `\s]+)(?:` + "`" + `)?`,
-		`UPDATE\s+(?:` + "`" + `)?([^` + "`" + `\s]+)(?:` + "`" + `)?`,
-		`DELETE\s+FROM\s+(?:` + "`" + `)?([^` + "`" + `\s]+)(?:` + "`" + `)?`,
-		`ALTER\s+TABLE\s+(?:` + "`" + `)?([^` + "`" + `\s]+)(?:` + "`" + `)?`,
-		`DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:` + "`" + `)?([^` + "`" + `\s]+)(?:` + "`" + `)?`,
-	}
-
-	for _, pattern := range patterns {
-		re := regexp.MustCompile(pattern)
+	for _, re := range regexes {
 		if matches := re.FindStringSubmatch(upper); len(matches) > 1 {
-			// 转为小写并去除反引号
-			return strings.Trim(strings.ToLower(matches[1]), "`")
+			table := matches[1]
+			if len(table) >= 2 && table[0] == '`' && table[len(table)-1] == '`' {
+				table = table[1 : len(table)-1]
+			}
+			return strings.ToLower(table)
 		}
 	}
-	return "misc" // 无法识别表名的语句归类为misc
+	return "misc"
 }
 
-func (s *Splitter) writeStatement(table, statement string) error {
+func (s *Splitter) writeStatement(stmt, table string) error {
 	_, exists := s.tables[table]
 	if !exists {
 		p := filepath.Join(s.output, table+".sql")
@@ -82,17 +69,13 @@ func (s *Splitter) writeStatement(table, statement string) error {
 		s.tables[table] = f
 	}
 
-	// 添加到缓冲区
-	s.buffers[table] = append(s.buffers[table], statement)
+	// 添加到缓冲区并更新计数器
+	s.count += len(stmt)
+	s.buffers[table] = append(s.buffers[table], stmt)
 
-	// 检查是否需要刷新缓冲区（减少IO次数提升性能）
-	total := 0
-	for _, buffer := range s.buffers {
-		for _, buf := range buffer {
-			total += len(buf)
-		}
-	}
-	if total > bufferSize {
+	// 使用缓存计数器，避免O(n²)复杂度
+	if s.count > bufferSize {
+		s.count = 0 // 重置计数器
 		return s.flushBuffers()
 	}
 	return nil
@@ -111,7 +94,7 @@ func (s *Splitter) flushBuffers() error {
 		}
 
 		// 合并缓冲区
-		str := strings.Builder{}
+		str := &strings.Builder{}
 		str.Grow(len(buffer) * 100)
 		for _, buf := range buffer {
 			str.WriteString(buf)
@@ -131,29 +114,15 @@ func (s *Splitter) flushBuffers() error {
 	return nil
 }
 
+// Split 粗暴优化版：直接按分号分割处理
 func (s *Splitter) Split() error {
-	var (
-		err error
-
-		input     *os.File
-		inputInfo os.FileInfo
-
-		count    int64
-		leftover string // 存储缓冲区边界上的不完整语句
-
-		startTime      = time.Now()
-		totalBytes     = int64(0)
-		processedBytes = int64(0)
-	)
-
 	// 创建输出目录
-	err = os.MkdirAll(s.output, os.ModePerm)
-	if err != nil {
+	if err := os.MkdirAll(s.output, os.ModePerm); err != nil {
 		return fmt.Errorf("创建输出目录失败: %w", err)
 	}
 
 	// 打开输入文件
-	input, err = os.Open(s.input)
+	input, err := os.Open(s.input)
 	if err != nil {
 		return fmt.Errorf("打开输入文件失败: %w", err)
 	}
@@ -162,16 +131,20 @@ func (s *Splitter) Split() error {
 		s.closeFiles()
 	}()
 
-	// 获取输入文件信息
-	inputInfo, err = os.Stat(s.input)
-	if err != nil {
-		return fmt.Errorf("获取输入文件信息失败: %w", err)
-	}
-	totalBytes = inputInfo.Size()
-	fmt.Printf("正在处理文件: %s (%.2f GB)\n", s.input, float64(totalBytes)/(1024*1024*1024))
+	// 获取文件大小并显示
+	info, _ := os.Stat(s.input)
+	fmt.Printf("正在处理文件: %s (%.2f GB)\n", s.input, float64(info.Size())/(1024*1024))
 
-	n := 0
-	buffer := make([]byte, bufferSize)
+	// 分块读取并按分号分割
+	var (
+		n      int
+		buffer = make([]byte, bufferSize)
+
+		count int64
+		start = time.Now()
+		cache = &strings.Builder{}
+	)
+
 	for {
 		n, err = input.Read(buffer)
 		if err == io.EOF {
@@ -180,61 +153,63 @@ func (s *Splitter) Split() error {
 		if err != nil {
 			return fmt.Errorf("读取文件失败: %w", err)
 		}
+
 		if n > 0 {
-			processedBytes += int64(n)
+			cache.Write(buffer[:n])
+			parts := strings.Split(cache.String(), ";")
 
-			// 简化进度显示（每50MB显示一次）
-			if processedBytes%progressStep == 0 && totalBytes > 0 {
-				elapsed := time.Since(startTime)
-				percentage := float64(processedBytes) / float64(totalBytes) * 100
-				fmt.Printf("\r进度: %.2f%% - 已用时: %v", percentage, elapsed.Round(time.Second))
-			}
+			// 处理除最后一部分外的所有完整语句
+			for i := 0; i < len(parts)-1; i++ {
+				stmt := strings.TrimSpace(parts[i])
+				if len(stmt) == 0 ||
+					strings.HasPrefix(stmt, "/*") ||
+					strings.HasPrefix(stmt, "--") {
+					continue
+				}
 
-			// 将读取的数据与上次的剩余数据合并
-			chunk := leftover + string(buffer[:n])
-			leftover = "" // 清空剩余数据
+				// 解析表名并写入语句
+				table := s.parseTable(stmt)
+				err = s.writeStatement(stmt+";", table)
+				if err != nil {
+					return err
+				}
 
-			// 按分号分割语句
-			statements := strings.Split(chunk, ";")
-
-			// 处理除最后一个外的所有语句（它们都是完整的）
-			for i := 0; i < len(statements)-1; i++ {
-				statement := strings.TrimSpace(statements[i])
-				if s.hasValid(statement) {
-					err = s.writeStatement(s.parseTable(statement), statement+";")
-					if err != nil {
-						return err
-					}
-					count++
+				count++
+				if count%5000 == 0 {
+					elapsed := time.Since(start)
+					fmt.Printf("\r已处理: %d 条SQL语句 - 用时: %v", count, elapsed.Round(time.Second))
 				}
 			}
 
-			// 最后一个部分可能是不完整的语句
-			lastPart := strings.TrimSpace(statements[len(statements)-1])
-			if err == io.EOF {
-				// 文件结束，处理最后一个语句（如果有的话）
-				if s.hasValid(lastPart) {
-					err = s.writeStatement(s.parseTable(lastPart), lastPart)
-					if err != nil {
-						return err
-					}
-					count++
-				}
-			} else {
-				// 不是文件结束，保存为下次处理的剩余数据
-				leftover = lastPart
+			// 保留最后一个未完成的部分
+			cache.Reset()
+			if len(parts) > 0 {
+				cache.WriteString(parts[len(parts)-1])
 			}
 		}
 	}
 
+	// 处理最后剩余的内容
+	if cache.Len() > 0 {
+		stmt := strings.TrimSpace(cache.String())
+		if len(stmt) > 0 &&
+			!strings.HasPrefix(stmt, "/*") &&
+			!strings.HasPrefix(stmt, "--") {
+			table := s.parseTable(stmt)
+			if err = s.writeStatement(stmt, table); err != nil {
+				return err
+			}
+			count++
+		}
+	}
+
 	// 刷新所有缓冲区
-	err = s.flushBuffers()
-	if err != nil {
+	if err = s.flushBuffers(); err != nil {
 		return err
 	}
 
 	// 显示最终结果
-	elapsed := time.Since(startTime)
+	elapsed := time.Since(start)
 	fmt.Printf("\r处理完成！共处理 %d 条SQL语句 - 总用时: %v\n", count, elapsed.Round(time.Second))
 	return nil
 }
