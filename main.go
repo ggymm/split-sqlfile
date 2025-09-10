@@ -11,7 +11,9 @@ import (
 	"time"
 )
 
-const bufferSize = 16 * 1024 * 1024 // 16MB 缓冲区
+const (
+	bufferSize = 128 * 1024 * 1024 // 缓冲区
+)
 
 var (
 	dropReg   = regexp.MustCompile(`DROP\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:` + "`" + `)?([^` + "`" + `\s]+)(?:` + "`" + `)?`)
@@ -140,9 +142,9 @@ func (s *Splitter) Split() error {
 		n      int
 		buffer = make([]byte, bufferSize)
 
-		count int64
-		start = time.Now()
-		cache = &strings.Builder{}
+		count   int64
+		start   = time.Now()
+		builder = &strings.Builder{}
 	)
 
 	for {
@@ -155,8 +157,8 @@ func (s *Splitter) Split() error {
 		}
 
 		if n > 0 {
-			cache.Write(buffer[:n])
-			parts := strings.Split(cache.String(), ";")
+			builder.Write(buffer[:n])
+			parts := strings.Split(builder.String(), ";")
 
 			// 处理除最后一部分外的所有完整语句
 			for i := 0; i < len(parts)-1; i++ {
@@ -175,23 +177,21 @@ func (s *Splitter) Split() error {
 				}
 
 				count++
-				if count%5000 == 0 {
-					elapsed := time.Since(start)
-					fmt.Printf("\r已处理: %d 条SQL语句 - 用时: %v", count, elapsed.Round(time.Second))
-				}
+				elapsed := time.Since(start)
+				fmt.Printf("\r已处理: %d 条SQL语句 - 用时: %v", count, elapsed.Round(time.Second))
 			}
 
 			// 保留最后一个未完成的部分
-			cache.Reset()
+			builder.Reset()
 			if len(parts) > 0 {
-				cache.WriteString(parts[len(parts)-1])
+				builder.WriteString(parts[len(parts)-1])
 			}
 		}
 	}
 
 	// 处理最后剩余的内容
-	if cache.Len() > 0 {
-		stmt := strings.TrimSpace(cache.String())
+	if builder.Len() > 0 {
+		stmt := strings.TrimSpace(builder.String())
 		if len(stmt) > 0 &&
 			!strings.HasPrefix(stmt, "/*") &&
 			!strings.HasPrefix(stmt, "--") {
@@ -209,6 +209,9 @@ func (s *Splitter) Split() error {
 	}
 
 	// 显示最终结果
+	for table := range s.tables {
+		fmt.Printf("source %s%s.sql;\n", s.output, table)
+	}
 	elapsed := time.Since(start)
 	fmt.Printf("\r处理完成！共处理 %d 条SQL语句 - 总用时: %v\n", count, elapsed.Round(time.Second))
 	return nil
